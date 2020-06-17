@@ -1,0 +1,46 @@
+version(1);
+
+project_name = "PGLA";
+
+patterns = {
+	"*.c",
+	"*.cu",
+	"*.h",
+	"*.4coder",
+	"*.mk"
+};
+
+blacklist_patterns = {
+	".*",
+	"external"
+};
+
+load_paths_base = {
+	{ ".", .relative = true, .recursive = true, }
+};
+
+load_paths = {
+	{ load_paths_base, .os = "linux", }
+};
+
+command_list = {
+	{
+		.name = "build debug",
+   	 .out = "*compilation*",
+		.footer_panel = false,
+		.save_dirty_files = true,
+		.cursor_at_end = false,
+	    .cmd = {{ "make debug", .os = "linux" }},
+    },
+	{
+		.name = "build release",
+   	 .out = "*compilation*",
+		.footer_panel = false,
+		.save_dirty_files = true,
+		.cursor_at_end = false,
+	    .cmd = {{ "make release", .os = "linux" }},
+    }
+};
+	      
+fkey_command[1] = "build debug";
+fkey_command[2] = "build release";
