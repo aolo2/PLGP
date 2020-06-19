@@ -6,6 +6,7 @@
 #include <assert.h>
 
 #define MASTER 0
+#define REF 0
 
 typedef unsigned vertex_id_t;
 typedef unsigned long long edge_id_t;
@@ -16,13 +17,30 @@ typedef struct vec {
     int cap;
 } vec;
 
+typedef struct vecf {
+    float *data;
+    int size;
+    int cap;
+} vecf;
+
 typedef struct graph_t {
     vertex_id_t n;
     edge_id_t m;
     vertex_id_t offset;
     edge_id_t *starts;
     vertex_id_t *ends;
+    int *sigma;
+    vec *predecessors;
+    int master_size;
 } graph_t;
+
+typedef struct csr2 {
+    vec starts;
+    vec counts;
+    vec dist;
+    vec sigma;
+    vec ends;
+} csr2;
 
 static void
 vec_push(vec *v, int item)
@@ -54,6 +72,33 @@ vec_clear(vec *v)
 {
     v->size = 0;
 }
+
+static inline void
+vecf_clear(vecf *v)
+{
+    v->size = 0;
+}
+
+static void
+vecf_push(vecf *v, float item)
+{
+    if (v->size == v->cap) {
+        if (v->cap == 0) {
+            v->cap = 4;
+        } else {
+            v->cap *= 2;
+        }
+        
+        v->data = realloc(v->data, v->cap * sizeof(float));
+    }
+    
+    v->data[v->size++] = item;
+}
+
+#if REF
+#include "brandes_cpu.c"
+#endif
+
 
 static graph_t
 read_graph(char *filename)
@@ -104,6 +149,7 @@ master_partition_graph_1d(MPI_Comm comm, int size, graph_t graph)
 {
     int nverts = graph.n;
     int batch_size = nverts / size;
+    int master_verts_count = graph.n;
     
     MPI_Request *throwaway = malloc(size * sizeof(MPI_Request));
     assert(throwaway);
@@ -125,6 +171,7 @@ master_partition_graph_1d(MPI_Comm comm, int size, graph_t graph)
         MPI_Isend(&from, 1, MPI_INT, p, 0, comm, throwaway + p);
         MPI_Isend(&verts_count, 1, MPI_INT, p, 0, comm, throwaway + p);
         MPI_Isend(&edges_count, 1, MPI_INT, p, 0, comm, throwaway + p);
+        MPI_Isend(&master_verts_count, 1, MPI_INT, p, 0, comm, throwaway + p);
         
         MPI_Isend(graph.starts + from, verts_count + 1, MPI_LONG, p, 0, comm, throwaway + p);
         MPI_Isend(graph.ends + edges_from, edges_count, MPI_INT, p, 0, comm, throwaway + p);
@@ -137,24 +184,31 @@ all_receive_partitions_1d(MPI_Comm comm, int rank, int size)
     int nverts = 0;
     int nedges = 0;
     int offset = 0;
+    int master_size = 0;
     
     MPI_Barrier(comm);
     
     MPI_Recv(&offset, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
     MPI_Recv(&nverts, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
     MPI_Recv(&nedges, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
+    MPI_Recv(&master_size, 1, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
     
     graph_t result = { 0 };
     
     result.n = nverts;
     result.m = nedges;
     result.offset = offset;
+    result.master_size = master_size;
     
     result.starts = (edge_id_t *) malloc((result.n + 1) * sizeof(edge_id_t));
     result.ends = (vertex_id_t *) malloc(result.m * sizeof(vertex_id_t));
+    result.sigma = (int *) malloc(result.n * sizeof(int));
+    result.predecessors = (vec *) calloc(1, result.n * sizeof(vec));
     
     assert(result.starts);
     assert(result.ends);
+    assert(result.sigma);
+    assert(result.predecessors);
     
     MPI_Recv(result.starts, result.n + 1, MPI_LONG, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
     MPI_Recv(result.ends, result.m, MPI_INT, MPI_ANY_SOURCE, MPI_ANY_TAG, comm, 0);
@@ -188,7 +242,7 @@ all_should_terminate(MPI_Comm comm, int rank, int size, vec FS)
 }
 
 static void
-all_collect_local_neighbours(graph_t graph, vec FS, vec *NS, int rank)
+all_collect_local_neighbours(graph_t graph, vec FS, vec *NS)
 {
     int offset = graph.offset;
     
@@ -209,7 +263,43 @@ all_collect_local_neighbours(graph_t graph, vec FS, vec *NS, int rank)
 }
 
 static void
-all_send_owned(MPI_Comm comm, int rank, int size, graph_t graph, vec NS,
+all_collect_local_neighbours_csr(graph_t graph, int *all_dist, vec FS, csr2 *frontier)
+{
+    int offset = graph.offset;
+    
+    vec starts = { 0 };
+    vec counts = { 0 };
+    vec dist = { 0 };
+    vec sigma = { 0 }; 
+    vec ends = { 0 };
+    
+    /* NOTE(aolo2): collect neighbours */
+    for (int i = 0; i < FS.size; ++i) {
+        int vertex = FS.data[i];
+        
+        int from = graph.starts[vertex - offset];
+        int to = graph.starts[vertex + 1 - offset];
+        
+        vec_push(&starts, vertex);
+        vec_push(&counts, to - from);
+        vec_push(&dist, all_dist[vertex - offset]);
+        vec_push(&sigma, graph.sigma[vertex - offset]);
+        
+        for (unsigned e = from - graph.starts[0]; e < to - graph.starts[0]; ++e) {
+            int end = graph.ends[e];
+            vec_push(&ends, end);
+        }
+    }
+    
+    frontier->starts = starts;
+    frontier->counts = counts;
+    frontier->dist = dist;
+    frontier->sigma = sigma;
+    frontier->ends = ends;
+}
+
+static void
+all_send_owned(MPI_Comm comm, int rank, int size, vec NS,
                int other, int other_offset, int other_count)
 {
     vec NS_owned_by_other = { 0 };
@@ -226,8 +316,57 @@ all_send_owned(MPI_Comm comm, int rank, int size, graph_t graph, vec NS,
     MPI_Isend(NS_owned_by_other.data, NS_owned_by_other.size, MPI_INT, other, 0, comm, &throwaway);
 }
 
+
 static void
-all_receive_owned(MPI_Comm comm, int rank, int size, graph_t graph, vec *NS, int other)
+all_send_owned_csr(MPI_Comm comm, int rank, int size, csr2 frontier,
+                   graph_t graph, int offset, int *all_dist, int other, int other_offset, int other_count)
+{
+    vec starts_other = { 0 };
+    vec counts_other = { 0 };
+    vec ends_other = { 0 };
+    vec dist = { 0 };
+    vec sigma = { 0 };
+    
+    int *end = frontier.ends.data;
+    
+    for (int v = 0; v < frontier.starts.size; ++v) {
+        int start = frontier.starts.data[v];
+        int neighbours_owned = 0;
+        
+        for (int i = 0; i < frontier.counts.data[v]; ++i) {
+            int e = *end++;
+            if (owned_by(e, other_offset, other_count)) {
+                vec_push(&ends_other, e);
+                ++neighbours_owned;
+            }
+        }
+        
+        if (neighbours_owned > 0) {
+            vec_push(&starts_other, start);
+            vec_push(&counts_other, neighbours_owned);
+            vec_push(&dist, all_dist[start - offset]);
+            vec_push(&sigma, graph.sigma[start - offset]);
+        }
+    }
+    
+    int nverts = starts_other.size;
+    
+    MPI_Request throwaway;
+    
+    MPI_Isend(&starts_other.size, 1, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(&ends_other.size, 1, MPI_INT, other, 0, comm, &throwaway);
+    
+    MPI_Isend(starts_other.data, nverts, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(counts_other.data, nverts, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(dist.data, nverts, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(sigma.data, nverts, MPI_INT, other, 0, comm, &throwaway);
+    
+    MPI_Isend(ends_other.data, ends_other.size, MPI_INT, other, 0, comm, &throwaway);
+}
+
+
+static void
+all_receive_owned(MPI_Comm comm, int rank, int size, vec *NS, int other)
 {
     int other_count;
     int *other_data;
@@ -245,6 +384,47 @@ all_receive_owned(MPI_Comm comm, int rank, int size, graph_t graph, vec *NS, int
 }
 
 static void
+all_receive_owned_csr(MPI_Comm comm, int rank, int size, csr2 *frontier, int other)
+{
+    int nstarts = 0;
+    int nends = 0;
+    
+    int *starts = NULL;
+    int *counts = NULL;
+    int *dist = NULL;
+    int *sigma = NULL;
+    int *ends = NULL;
+    
+    MPI_Recv(&nstarts, 1, MPI_INT, other, MPI_ANY_TAG, comm, 0);
+    MPI_Recv(&nends, 1, MPI_INT, other, MPI_ANY_TAG, comm, 0);
+    
+    starts = malloc(nstarts * sizeof(int));
+    counts = malloc(nstarts * sizeof(int));
+    dist = malloc(nstarts * sizeof(int));
+    sigma = malloc(nstarts * sizeof(int));
+    ends = malloc(nends * sizeof(int));
+    
+    MPI_Recv(starts, nstarts, MPI_INT, other, 0, comm, 0);
+    MPI_Recv(counts, nstarts, MPI_INT, other, 0, comm, 0);
+    MPI_Recv(dist, nstarts, MPI_INT, other, 0, comm, 0);
+    MPI_Recv(sigma, nstarts, MPI_INT, other, 0, comm, 0);
+    
+    MPI_Recv(ends, nends, MPI_INT, other, 0, comm, 0);
+    
+    for (int i = 0; i < nstarts; ++i) {
+        vec_push(&frontier->starts, starts[i]);
+        vec_push(&frontier->counts, counts[i]);
+        vec_push(&frontier->dist, dist[i]);
+        vec_push(&frontier->sigma, sigma[i]);
+    }
+    
+    for (int i = 0; i < nends; ++i) {
+        vec_push(&frontier->ends, ends[i]);
+    }
+}
+
+
+static void
 all_exchange_offsets(MPI_Comm comm, int rank, int size, graph_t graph, int *offsets, int *counts)
 {
     MPI_Allgather(&graph.offset, 1, MPI_INT, offsets, 1, MPI_INT, comm);
@@ -259,6 +439,7 @@ all_bfs(MPI_Comm comm, int rank, int size, graph_t graph, int start, int *offset
     int count = graph.n;
     vec FS = { 0 };
     vec NS = { 0 };
+    
     
     for (unsigned v = 0; v < graph.n; ++v) {
         dist[v] = -1;
@@ -280,17 +461,17 @@ all_bfs(MPI_Comm comm, int rank, int size, graph_t graph, int start, int *offset
             break;
         }
         
-        all_collect_local_neighbours(graph, FS, &NS, rank);
+        all_collect_local_neighbours(graph, FS, &NS);
         
         for (int p = 0; p < size; ++p) {
             if (p != rank) {
-                all_send_owned(comm, rank, size, graph, NS, p, offsets[p], counts[p]);
+                all_send_owned(comm, rank, size, NS, p, offsets[p], counts[p]);
             }
         }
         
         for (int p = 0; p < size; ++p) {
             if (p != rank) {
-                all_receive_owned(comm, rank, size, graph, &NS, p);
+                all_receive_owned(comm, rank, size, &NS, p);
             }
         }
         
@@ -308,12 +489,273 @@ all_bfs(MPI_Comm comm, int rank, int size, graph_t graph, int start, int *offset
     }
 }
 
+
+static int
+all_max_level(MPI_Comm comm, int level)
+{
+    int max_level;
+    MPI_Allreduce(&level, &max_level, 1, MPI_INT, MPI_MAX, comm);
+    return(max_level);
+}
+
+static void
+all_send_predecessors(MPI_Comm comm, int rank, int size, vec external_predecessors, vec external_sigma, vecf external_delta, int other, int other_offset, int other_count)
+{
+    vec preds_owned_by_other = { 0 };
+    vec sigma_owned_by_other = { 0 };
+    vecf delta_owned_by_other = { 0 };
+    
+    for (int i = 0; i < external_predecessors.size; ++i) {
+        int p = external_predecessors.data[i];
+        if (owned_by(p, other_offset, other_count)) {
+            vec_push(&preds_owned_by_other, p);
+            vec_push(&sigma_owned_by_other, external_sigma.data[i]);
+            vecf_push(&delta_owned_by_other, external_delta.data[i]);
+        }
+    }
+    
+    
+    int count = preds_owned_by_other.size;
+    
+    //printf("%d sends %d to %d\n", rank, count, other);
+    
+    MPI_Request throwaway;
+    
+    MPI_Isend(&count, 1, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(preds_owned_by_other.data, count, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(sigma_owned_by_other.data, count, MPI_INT, other, 0, comm, &throwaway);
+    MPI_Isend(delta_owned_by_other.data, count, MPI_FLOAT, other, 0, comm, &throwaway);
+}
+
+static void
+all_receive_predecessors(MPI_Comm comm, int rank, int size, vec *external_predecessors, vec *external_sigma, vecf *external_delta, int other)
+{
+    int count;
+    int *other_preds = NULL;
+    int *other_sigma = NULL;
+    float *other_delta = NULL;
+    
+    MPI_Recv(&count, 1, MPI_INT, other, MPI_ANY_TAG, comm, 0);
+    
+    other_preds = malloc(count * sizeof(int));
+    other_sigma = malloc(count * sizeof(int));
+    other_delta = malloc(count * sizeof(float));
+    
+    assert(other_preds);
+    assert(other_sigma);
+    assert(other_delta);
+    
+    MPI_Recv(other_preds, count, MPI_INT, other, MPI_ANY_TAG, comm, 0);
+    MPI_Recv(other_sigma, count, MPI_INT, other, MPI_ANY_TAG, comm, 0);
+    MPI_Recv(other_delta, count, MPI_FLOAT, other, MPI_ANY_TAG, comm, 0);
+    
+    for (int i = 0; i < count; ++i) {
+        vec_push(external_predecessors, other_preds[i]);
+        vec_push(external_sigma, other_sigma[i]);
+        vecf_push(external_delta, other_delta[i]);
+    }
+    
+    //printf("%d receive %d from %d\n", rank, count, other);
+    
+    free(other_preds);
+    free(other_sigma);
+    free(other_delta);
+}
+
+static void
+all_brandes(MPI_Comm comm, int rank, int size, graph_t graph, int start, int *offsets, int *counts, int *dist, double *bc)
+{
+    int level = 0;
+    int offset = graph.offset;
+    int count = graph.n;
+    vec FS = { 0 };
+    csr2 frontier = { 0 };
+    double *delta = malloc(count * sizeof(double));
+    
+    for (int v = 0; v < count; ++v) {
+        dist[v] = -1;
+        delta[v] = 0;
+        graph.sigma[v] = 0;
+        vec_clear(graph.predecessors + v);
+    }
+    
+    if (owned_by(start, offset, count)) {
+        dist[start - offset] = 0;
+        graph.sigma[start - offset] = 1;
+    }
+    
+    for (;;) {
+        vec_clear(&FS);
+        for (int v = 0; v < count; ++v) {
+            if (dist[v] == level) {
+                vec_push(&FS, v + offset);
+            }
+        }
+        
+        if (all_should_terminate(comm, rank, size, FS)) {
+            break;
+        }
+        
+        all_collect_local_neighbours_csr(graph, dist, FS, &frontier);
+        
+        for (int p = 0; p < size; ++p) {
+            if (p != rank) {
+                all_send_owned_csr(comm, rank, size, frontier, 
+                                   graph, offset, dist, p, offsets[p], counts[p]);
+            }
+        }
+        
+        for (int p = 0; p < size; ++p) {
+            if (p != rank) {
+                all_receive_owned_csr(comm, rank, size, &frontier, p);
+            }
+        }
+        
+        int *end = frontier.ends.data;
+        
+        for (int v = 0; v < frontier.starts.size; ++v) {
+            int start = frontier.starts.data[v];
+            for (int i = 0; i < frontier.counts.data[v]; ++i) {
+                int e = *end++;
+                if (owned_by(e, offset, count)) {
+                    int w = e - offset;
+                    
+                    // w found for the first time [comment from brandes01]
+                    if (dist[w] < 0) {
+                        dist[w] = frontier.dist.data[v] + 1;
+                    }
+                    
+                    // shortest path to w via v? [comment from brandes01]
+                    if (dist[w] == frontier.dist.data[v] + 1) {
+                        graph.sigma[w] += frontier.sigma.data[v];
+                        vec_push(graph.predecessors + w, start);
+                    }
+                }
+            }
+        }
+        
+        ++level;
+    }
+    
+    int global_level = all_max_level(comm, level);
+    
+    while (global_level >= 0) {
+        vec  external_predecessors = { 0 };
+        vec  external_sigma = { 0 };
+        vecf external_delta = { 0 };
+        
+        /* NOTE(aolo2): get predecessors of w that belong to other procceses, for each of them
+also get delta[w] and sigma[w] */
+        for (int w = 0; w < count; ++w) {
+            if (dist[w] == global_level) {
+                
+                //printf("%d[%d] ", w + offset, dist[w]);
+                
+                vec preds = graph.predecessors[w];
+                for (int i = 0; i < preds.size; ++i) {
+                    int v = preds.data[i];
+                    //printf("%d = predecessor of %d[%d]\n", v, w + offset, dist[w]);
+                    if (owned_by(v, offset, count)) {
+                        delta[v - offset] += (double) graph.sigma[v - offset] / graph.sigma[w] * (1.0 + delta[w]);
+                        //printf("local %d %d %d %.2f. delta[%d] now is %.2f\n", v, graph.sigma[v - offset], graph.sigma[w], delta[w], v, delta[v - offset]);
+                    } else {
+                        vec_push(&external_predecessors, v);
+                        vec_push(&external_sigma, graph.sigma[w]);
+                        vecf_push(&external_delta, delta[w]);
+                    }
+                }
+            }
+        }
+        
+        for (int p = 0; p < size; ++p) {
+            if (p != rank) {
+                all_send_predecessors(comm, rank, size, 
+                                      external_predecessors, external_sigma, external_delta, 
+                                      p, offsets[p], counts[p]);
+            }
+        }
+        
+        vec_clear(&external_predecessors);
+        vec_clear(&external_sigma);
+        vecf_clear(&external_delta);
+        
+        for (int p = 0; p < size; ++p) {
+            if (p != rank) {
+                all_receive_predecessors(comm, rank, size, 
+                                         &external_predecessors, &external_sigma, &external_delta, 
+                                         p);
+            }
+        }
+        
+        for (int i = 0; i < external_predecessors.size; ++i) {
+            int v = external_predecessors.data[i];
+            int sigma_w = external_sigma.data[i];
+            float delta_w = external_delta.data[i];
+            delta[v - offset] += (double) graph.sigma[v - offset] / sigma_w * (1.0 + delta_w);
+            //printf("external %d %d %d %.2f. delta[%d] now is %.2f\n", v, graph.sigma[v - offset], sigma_w, delta_w, v, delta[v - offset]);
+        }
+        
+        for (int w = 0; w < count; ++w) {
+            if (dist[w] == global_level) {
+                if (w != start - offset) {
+                    bc[w] += delta[w];
+                }
+            }
+        }
+        
+        --global_level;
+        
+        MPI_Barrier(comm);
+    }
+    
+    
+#if 1
+    for (int i = 0; i < size; ++i) {
+        
+        if (i == rank) {
+            printf("RANK %d\n", rank);
+            //for (int v = 0; v < count; ++v) {
+            //printf("preds %d:", v + offset);
+            //for (int w = 0; w < graph.predecessors[v].size; ++w) {
+            //printf(" %d", graph.predecessors[v].data[w]);
+            //}
+            //printf("\n");
+            //}
+            
+            //printf("sigma:");
+            //for (int i = 0; i < count; ++i) {
+            //printf(" %d", graph.sigma[i]);
+            //}
+            //printf("\n");
+            
+            printf("START=%d. delta:", start);
+            for (int i = 0; i < count; ++i) {
+                printf(" %.2f", delta[i]);
+            }
+            printf("\n");
+            fflush(stdout);
+        }
+        
+        MPI_Barrier(comm);
+    }
+#endif
+}
+
+
 static void
 all_send_dist(MPI_Comm comm, int count, int *dist)
 {
     MPI_Request throwaway;
     MPI_Isend(&count, 1, MPI_INT, MASTER, 0, comm, &throwaway);
     MPI_Isend(dist, count, MPI_INT, MASTER, 0, comm, &throwaway);
+}
+
+static void
+all_send_bc(MPI_Comm comm, int count, double *bc)
+{
+    MPI_Request throwaway;
+    MPI_Isend(&count, 1, MPI_INT, MASTER, 0, comm, &throwaway);
+    MPI_Isend(bc, count, MPI_DOUBLE, MASTER, 0, comm, &throwaway);
 }
 
 static void
@@ -325,6 +767,19 @@ master_gather_dist(MPI_Comm comm, int size, int *dist)
     for (int i = 0; i < size; ++i) {
         MPI_Recv(&count, 1, MPI_INT, i, MPI_ANY_TAG, comm, 0);
         MPI_Recv(dist + accum, count, MPI_INT, i, MPI_ANY_TAG, comm, 0);
+        accum += count;
+    }
+}
+
+static void
+master_gather_bc(MPI_Comm comm, int size, double *bc)
+{
+    int accum = 0;
+    int count;
+    
+    for (int i = 0; i < size; ++i) {
+        MPI_Recv(&count, 1, MPI_INT, i, MPI_ANY_TAG, comm, 0);
+        MPI_Recv(bc + accum, count, MPI_DOUBLE, i, MPI_ANY_TAG, comm, 0);
         accum += count;
     }
 }
@@ -348,6 +803,24 @@ master_print_graph(graph_t graph)
 int
 main(int argc, char **argv)
 {
+#if REF
+    
+    graph_t graph = read_graph(argv[1]);
+    double *betweenness_centrality = (double *) calloc(1, graph.n * sizeof(double));
+    
+    for (unsigned v = 0; v < graph.n; ++v) {
+        brandes_cpu(betweenness_centrality, graph.starts, graph.ends, 
+                    graph.n, v);
+    }
+    
+    printf("BC: ");
+    for (unsigned v = 0; v < graph.n; ++v) {
+        printf("%.2ff ", betweenness_centrality[v]);
+    }
+    printf("\n");
+    
+#else
+    
     int rank, size;
     
     MPI_Init(&argc, &argv);
@@ -370,7 +843,9 @@ main(int argc, char **argv)
     int *counts = malloc(size * sizeof(int));
     int *dist = NULL;
     int *master_dist = NULL;
-    int start = 0;
+    double *master_bc = NULL;
+    //int start = 0;
+    double *bc = NULL;
     
     assert(offsets);
     assert(counts);
@@ -384,27 +859,42 @@ main(int argc, char **argv)
     graph = all_receive_partitions_1d(comm, rank, size);
     
     dist = malloc(graph.n * sizeof(int));
+    bc = calloc(1, graph.n * sizeof(double));
+    
     assert(dist);
+    assert(bc);
     
     all_exchange_offsets(comm, rank, size, graph, offsets, counts);
-    all_bfs(comm, rank, size, graph, start, offsets, counts, dist);
-    all_send_dist(comm, graph.n, dist);
+    
+    //all_bfs(comm, rank, size, graph, start, offsets, counts, dist);
+    
+    for (int v = 0; v < graph.master_size; ++v) {
+        all_brandes(comm, rank, size, graph, v, offsets, counts, dist, bc);
+        MPI_Barrier(comm);
+    }
+    
+    //all_send_dist(comm, graph.n, dist);
+    all_send_bc(comm, graph.n, bc);
     
     if (rank == MASTER) {
         master_dist = malloc(master_graph.n * sizeof(int));
+        master_bc = malloc(master_graph.n * sizeof(double));
+        
         assert(master_dist);
+        assert(master_bc);
         
-        master_gather_dist(comm, size, master_dist);
+        //master_gather_dist(comm, size, master_dist);
+        master_gather_bc(comm, size, master_bc);
         
-        printf("DIST: ");
+        printf("BC: ");
         for (unsigned v = 0; v < master_graph.n; ++v) {
-            printf("%d ", master_dist[v]);
+            printf("%.2ff ", master_bc[v]);
         }
         printf("\n");
     }
     
     int rc = MPI_Finalize();
     
-    
     return(rc);
+#endif
 }
